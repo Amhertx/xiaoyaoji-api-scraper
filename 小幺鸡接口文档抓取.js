@@ -5,6 +5,8 @@
 // @description  自动抓取小幺鸡项目所有接口数据
 // @match        https://www.xiaoyaoji.cn/*
 // @grant        none
+// @downloadURL  https://raw.githubusercontent.com/Amhertx/xiaoyaoji-api-scraper/master/小幺鸡接口文档抓取.js
+// @updateURL    https://raw.githubusercontent.com/Amhertx/xiaoyaoji-api-scraper/master/小幺鸡接口文档抓取.js
 // ==/UserScript==
 
 (function() {
