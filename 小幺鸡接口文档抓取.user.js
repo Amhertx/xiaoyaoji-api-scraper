@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         小幺鸡接口自动抓取
 // @namespace    http://tampermonkey.net/
-// @version      2.30
+// @version      2.31
 // @description  自动抓取小幺鸡项目所有接口数据
 // @match        https://www.xiaoyaoji.cn/*
 // @grant        none
@@ -394,23 +394,38 @@
         return map;
     }
 
-    function buildOpenAPISpec(rawResponses, docIdToNameMap, interfaceNameMap, folderMap) {
+    async function fetchFolderName(docId) {
+        try {
+            const resp = await fetch(`https://api.xiaoyaoji.cn/project/document/${docId}`, {
+                method: 'GET', headers: { 'Accept': 'application/json' }
+            });
+            if (!resp.ok) return null;
+            const data = await resp.json();
+            return data?.data?.name || null;
+        } catch (e) {
+            console.error(`[文件夹名称] 获取 ${docId} 失败:`, e);
+            return null;
+        }
+    }
+
+    async function buildOpenAPISpec(rawResponses, docIdToNameMap, interfaceNameMap, folderMap, folderHierarchy) {
         const projectName = document.querySelector('.pro-name')?.textContent?.trim() || 'API文档';
         const openapi = {
             openapi: '3.0.0',
             info: { title: `${projectName} API`, version: '1.0.0', description: '从小幺鸡自动抓取' },
             servers: [], tags: [], paths: {}, components: { schemas: {} }
         };
+        const folderNameCache = {};
 
-        rawResponses.forEach(({ docId, data }) => {
+        for (const { docId, data } of rawResponses) {
             try {
                 const httpApi = data.content?.data?.content?.[0]?.attrs?.doc;
-                if (!httpApi) return;
+                if (!httpApi) continue;
 
                 const method = (httpApi.requestMethod || 'GET').toLowerCase();
                 const path = httpApi.url || '';
                 const parentId = data.parentId;
-                if (!path || !path.startsWith('/')) return;
+                if (!path || !path.startsWith('/')) continue;
 
                 // 解析接口名称
                 let interfaceName = docIdToNameMap.get(docId) || interfaceNameMap.get(docId) || '';
@@ -454,19 +469,40 @@
 
                 // 解析响应
                 const responseSchema = parseResponseBody(httpApi.resp?.body);
-                const category = path.split('/')[1] || 'default';
-                const cnCategory = folderMap[parentId] || category;
+                let cnCategory = folderMap[parentId];
+                if (!cnCategory && parentId) {
+                    if (folderNameCache[parentId] !== undefined) {
+                        cnCategory = folderNameCache[parentId];
+                    } else {
+                        cnCategory = await fetchFolderName(parentId);
+                        folderNameCache[parentId] = cnCategory;
+                        if (cnCategory) console.log(`[文件夹名称] API获取: ${parentId} -> ${cnCategory}`);
+                    }
+                }
+                if (!cnCategory) cnCategory = path.split('/')[1] || 'default';
+
+                // 构建面包屑路径：根文件夹作为tag，嵌套路径显示在标题中
+                let rootCategory = cnCategory;
+                if (folderHierarchy && folderHierarchy[parentId]) {
+                    const parts = [];
+                    let cur = parentId;
+                    while (cur && folderHierarchy[cur]) { parts.unshift(folderMap[cur] || cur); cur = folderHierarchy[cur]; }
+                    if (parts.length > 1) {
+                        rootCategory = parts[0];
+                        displayName = parts.join(' > ') + ' > ' + displayName;
+                    }
+                }
 
                 if (!openapi.paths[path]) openapi.paths[path] = {};
                 const operation = {
                     summary: displayName, description: httpApi.simpleDesc ? httpApi.simpleDesc.replace(/<[^>]+>/g, '') : '',
-                    tags: [cnCategory], parameters: parameters.length > 0 ? parameters : undefined,
+                    tags: [rootCategory], parameters: parameters.length > 0 ? parameters : undefined,
                     responses: { '200': { description: httpApi.resp?.desc || '成功', content: { 'application/json': { schema: { type: 'object', properties: responseSchema }, example: generateExample(responseSchema) } } } }
                 };
                 if (requestBodyObj) operation.requestBody = requestBodyObj;
                 openapi.paths[path][method] = operation;
             } catch (e) { console.log(`处理接口 ${docId} 出错:`, e.message); }
-        });
+        }
 
         // 生成 tags
         const usedTags = new Set();
@@ -485,47 +521,87 @@
     function generateMarkdownDoc(openapi, projectName) {
         let doc = `# ${projectName} API 接口文档\n> 生成时间: ${new Date().toLocaleString()}\n> 接口总数: ${Object.keys(openapi.paths).length}\n\n`;
 
+        const indent = (level) => level === 0 ? '' : ('&nbsp;&nbsp;'.repeat(level) + ' ');
+
         const paramTable = (title, params) => {
             if (!params.length) return '';
-            let s = `\n**${title}:**\n\n| 参数名 | 类型 | 必填 | 默认值 | 描述 |\n|--------|------|------|--------|------|\n`;
+            let s = `\n**${title}:**\n\n| 名称 | 类型 | 必填 | 默认值 | 描述 |\n|------|------|------|--------|------|\n`;
             params.forEach(p => {
-                s += `| ${p.name} | ${p.schema?.type || 'string'} | ${p.required ? '是' : '否'} | ${p.example || p.default || '-'} | ${cleanText(p.description, true) || '-'} |\n`;
+                s += `| ${p.name} | ${p.schema?.type || 'string'} | ${p.required ? '是' : '否'} | ${p.example || p.default || '-'} | ${cleanText(p.description) || '-'} |\n`;
+            });
+            return s;
+        };
+
+        const renderParamTree = (props, exampleObj, depth) => {
+            let s = '';
+            if (!props) return s;
+            Object.entries(props).forEach(([name, prop]) => {
+                let typeStr = prop.type || 'string';
+                if (typeStr === 'array' && prop.properties) typeStr = 'array[object]';
+                const desc = cleanText(prop.description) || '-';
+                const reqStr = prop.required ? '是' : '否';
+                const defStr = prop.default !== undefined ? String(prop.default) : '-';
+                s += `| ${indent(depth)}${name} | ${typeStr} | ${reqStr} | ${defStr} | ${desc} |\n`;
+                if (prop.properties) {
+                    const childEx = exampleObj?.[name];
+                    const exForChildren = Array.isArray(childEx) ? (childEx[0] || {}) : (childEx || {});
+                    s += renderParamTree(prop.properties, exForChildren, depth + 1);
+                }
             });
             return s;
         };
 
         openapi.tags.forEach(tag => {
             doc += `## ${tag.name}\n\n`;
+
+            // 按嵌套子文件夹分组
+            const nested = {};  // { subFolderName: [{method, path, api}] }
+            const rootApis = [];
+
             Object.entries(openapi.paths).forEach(([path, methods]) => {
                 Object.entries(methods).forEach(([method, api]) => {
                     if (api.tags?.[0] !== tag.name) return;
-                    doc += `### ${api.summary}\n- **请求方式**: \`${method.toUpperCase()}\`\n- **请求路径**: \`${path}\`\n`;
-                    if (api.description) doc += `- **接口描述**: ${api.description}\n`;
-
-                    const params = api.parameters || [];
-                    doc += paramTable('请求头参数', params.filter(p => p.in === 'header'));
-                    doc += paramTable('Query参数', params.filter(p => p.in === 'query'));
-
-                    // Body参数
-                    const bodyContent = api.requestBody?.content?.['application/x-www-form-urlencoded'];
-                    if (bodyContent?.schema?.properties) {
-                        const props = bodyContent.schema.properties, ex = bodyContent.example, reqFields = bodyContent.schema.required || [];
-                        doc += `\n**Body参数:**\n\n| 参数名 | 类型 | 必填 | 默认值 | 描述 |\n|--------|------|------|--------|------|\n`;
-                        Object.entries(props).forEach(([name, prop]) => {
-                            doc += `| ${name} | ${prop.type || 'string'} | ${reqFields.includes(name) ? '是' : '否'} | ${prop.default !== undefined ? prop.default : (ex?.[name] || '-')} | ${cleanText(prop.description, true) || '-'} |\n`;
-                        });
+                    const parts = api.summary.split(' > ');
+                    if (parts.length >= 3) {
+                        const subName = parts[1];
+                        if (!nested[subName]) nested[subName] = [];
+                        nested[subName].push({ method, path, api, displayName: parts.slice(2).join(' > ') });
+                    } else {
+                        rootApis.push({ method, path, api, displayName: api.summary });
                     }
+                });
+            });
 
-                    // 响应参数
-                    const respSchema = api.responses?.['200']?.content?.['application/json']?.schema;
-                    if (respSchema?.properties) {
-                        const respEx = api.responses['200'].content['application/json'].example;
-                        doc += `\n**响应参数:**\n\n| 参数名 | 类型 | 描述 | 示例值 |\n|--------|------|------|--------|\n`;
-                        Object.entries(respSchema.properties).forEach(([name, prop]) => {
-                            doc += `| ${name} | ${prop.type || 'string'} | ${cleanText(prop.description, true) || '-'} | ${respEx?.[name] !== undefined ? JSON.stringify(respEx[name]) : '-'} |\n`;
-                        });
-                    }
-                    doc += '\n---\n\n';
+            // 渲染单个接口
+            const renderApi = (method, path, api, name) => {
+                let s = `- **请求方式**: \`${method.toUpperCase()}\`\n- **请求路径**: \`${path}\`\n`;
+                if (api.description) s += `- **接口描述**: ${api.description}\n`;
+                const params = api.parameters || [];
+                s += paramTable('请求头参数', params.filter(p => p.in === 'header'));
+                s += paramTable('Query参数', params.filter(p => p.in === 'query'));
+                const bodyContent = api.requestBody?.content?.['application/x-www-form-urlencoded'];
+                if (bodyContent?.schema?.properties) {
+                    s += `\n**Body参数:**\n\n| 名称 | 类型 | 必填 | 默认值 | 描述 |\n|------|------|------|--------|------|\n`;
+                    s += renderParamTree(bodyContent.schema.properties, bodyContent.example, 0);
+                }
+                const respSchema = api.responses?.['200']?.content?.['application/json']?.schema;
+                if (respSchema?.properties) {
+                    s += `\n**响应参数:**\n\n| 名称 | 类型 | 必填 | 默认值 | 描述 |\n|------|------|------|--------|------|\n`;
+                    s += renderParamTree(respSchema.properties, api.responses['200'].content['application/json'].example, 0);
+                }
+                return s + '\n---\n\n';
+            };
+
+            // 根目录接口
+            rootApis.forEach(({ method, path, api, displayName }) => {
+                doc += `### ${displayName}\n${renderApi(method, path, api, displayName)}`;
+            });
+
+            // 嵌套子文件夹
+            Object.entries(nested).forEach(([subName, items]) => {
+                doc += `### ${subName}\n\n`;
+                items.forEach(({ method, path, api, displayName }) => {
+                    doc += `#### ${displayName}\n${renderApi(method, path, api, displayName)}`;
                 });
             });
         });
@@ -553,15 +629,67 @@
 
         updateButton('处理中...');
 
-        // 收集文件夹映射和接口名称
-        const docs = window.$nuxt?.$store?.state?.doc?.docs;
-        const folderMap = {};
-        Object.values(docs || {}).forEach(d => { if (d.type === 'folder') folderMap[d.docId] = d.name; });
+        // 收集文件夹映射
+        let folderMap = {};
+
+        // 方式1: 从 __NUXT__ 递归提取所有文件夹（包括嵌套）
+        if (window.__NUXT__) {
+            (function extract(obj) {
+                if (!obj || typeof obj !== 'object') return;
+                if (obj.docId && obj.name && obj.type === 'folder') folderMap[obj.docId] = obj.name;
+                for (const key in obj) { if (obj.hasOwnProperty(key)) extract(obj[key]); }
+            })(window.__NUXT__);
+            console.log(`[文件夹] __NUXT__提取: ${Object.keys(folderMap).length} 个`);
+        }
+
+        // 方式2: 从Vuex的顶层文件夹递归获取子文件夹
+        if (Object.keys(folderMap).length <= 11) {
+            const topFolderIds = Object.keys(folderMap);
+            const visited = new Set();
+            const fetchChildren = async (folderId) => {
+                if (visited.has(folderId)) return;
+                visited.add(folderId);
+                try {
+                    const resp = await fetch(`https://api.xiaoyaoji.cn/project/document/children/${folderId}`, {
+                        method: 'GET', headers: { 'Accept': 'application/json' }
+                    });
+                    if (!resp.ok) return;
+                    const data = await resp.json();
+                    if (data.code !== 0 || !data.data) return;
+                    data.data.forEach(doc => {
+                        if (doc.type === 'folder' && doc.docId && doc.name) {
+                            folderMap[doc.docId] = doc.name;
+                        }
+                    });
+                    for (const doc of data.data) {
+                        if (doc.type === 'folder') await fetchChildren(doc.docId);
+                    }
+                } catch (e) {}
+            };
+            for (const fid of topFolderIds) { await fetchChildren(fid); }
+            console.log(`[文件夹] 递归获取后共: ${Object.keys(folderMap).length} 个`);
+        }
+
+        // 构建文件夹层级关系 {childDocId: parentDocId}
+        const folderHierarchy = {};
+        if (window.__NUXT__) {
+            (function walk(obj) {
+                if (!obj || typeof obj !== 'object') return;
+                if (obj.docId && obj.parentId) folderHierarchy[obj.docId] = obj.parentId;
+                for (const key in obj) { if (obj.hasOwnProperty(key)) walk(obj[key]); }
+            })(window.__NUXT__);
+            console.log(`[层级] ${Object.keys(folderHierarchy).length} 个层级关系`);
+        }
+        if (Object.keys(folderMap).length === 0) {
+            const docs = window.$nuxt?.$store?.state?.doc?.docs;
+            Object.values(docs || {}).forEach(d => { if (d.type === 'folder') folderMap[d.docId] = d.name; });
+            console.log(`[文件夹] 降级使用Vuex store, ${Object.keys(folderMap).length} 个文件夹`);
+        }
 
         const docIdToNameMap = await collectInterfaceNames();
 
         // 生成 OpenAPI 和 Markdown
-        const { openapi, projectName } = buildOpenAPISpec(xhrState.rawResponses, docIdToNameMap, xhrState.interfaceNameMap, folderMap);
+        const { openapi, projectName } = await buildOpenAPISpec(xhrState.rawResponses, docIdToNameMap, xhrState.interfaceNameMap, folderMap, folderHierarchy);
         const apifoxFilename = `apifox_import_${Date.now()}.json`;
         const projectFilename = `api_doc_${Date.now()}.md`;
 
